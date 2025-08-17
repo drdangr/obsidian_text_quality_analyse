@@ -41,11 +41,8 @@ const DEFAULT_SETTINGS = {
   /** Name of the embedding model to use (e.g. text-embedding-ada-002). */
   embeddingModel: 'text-embedding-ada-002',
   /** Name of the chat model used for semantic role classification. */
-  chatModel: 'gpt-3.5-turbo'
-  ,
-  /** Color used for the lowest signal‑to‑noise (far from topic). Represented as a CSS hex string. */
-  snrMinColor: '#f9d1d1',
-  /** Color used for the highest signal‑to‑noise (close to topic). Represented as a CSS hex string. */
+  chatModel: 'gpt-3.5-turbo',
+  /** Color used for the maximum signal‑to‑noise intensity (1.0). */
   snrMaxColor: '#d1f9d1',
   /** Color used for the lowest complexity (simple text). Represented as a CSS hex string. */
   complexityMinColor: '#cccccc',
@@ -82,8 +79,12 @@ function computeHeuristicMetrics(paragraphs, topic) {
     );
     const uniq = new Set(cleaned.filter((w) => w.length > 0));
     const snr = words.length > 0 ? uniq.size / words.length : 0;
-    const longWords = cleaned.filter((w) => w.length > 6);
-    const complexity = words.length > 0 ? longWords.length / words.length : 0;
+    // Readability-based complexity (LIX + SMOG for Russian)
+    const lix = russianLixIndex(para);
+    const smogInfo = russianSmogIndex(para);
+    const smog = smogInfo.value;
+    const smogValid = smogInfo.valid;
+    const complexity = calculateComplexity(lix, smog, smogValid);
     let topicScore = 0;
     if (topicLower.length > 0) {
       const occur = para.toLowerCase().split(topicLower).length - 1;
@@ -92,6 +93,90 @@ function computeHeuristicMetrics(paragraphs, topic) {
     results.push({ snr, complexity, topic: topicScore });
   }
   return results;
+}
+
+// ===================== Readability helpers (RU) =====================
+function extractRussianWords(text) {
+  const match = text.match(/[А-Яа-яЁё]{2,}/gu);
+  return match ? match : [];
+}
+
+function splitSentencesRussian(text) {
+  if (!text) return [];
+  const parts = text
+    .replace(/\r\n/g, '\n')
+    .split(/[.!?…]+[\s\n]*/u)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return parts;
+}
+
+function countRussianSyllables(word) {
+  const vowels = 'аеёиоуыэюя';
+  let count = 0;
+  const w = (word || '').toLowerCase();
+  for (let i = 0; i < w.length; i++) {
+    if (vowels.indexOf(w[i]) !== -1) count++;
+  }
+  return count > 0 ? count : 1;
+}
+
+function russianSmogIndex(text) {
+  if (!text || !text.trim()) return { value: null, valid: false };
+  const sentences = splitSentencesRussian(text);
+  const numSentences = sentences.length;
+  const isValid = numSentences >= 3;
+  if (numSentences === 0) return { value: null, valid: false };
+  const words = extractRussianWords(text);
+  if (words.length === 0) return { value: null, valid: isValid };
+  let polysyllableCount = 0;
+  for (const w of words) {
+    if (countRussianSyllables(w) >= 3) polysyllableCount++;
+  }
+  try {
+    const smogRaw = polysyllableCount * (30 / numSentences);
+    const smog = 1.043 * Math.sqrt(smogRaw) + 3.1291;
+    return { value: Math.round(smog * 1000) / 1000, valid: isValid };
+  } catch (e) {
+    return { value: null, valid: isValid };
+  }
+}
+
+function russianLixIndex(text) {
+  if (!text || !text.trim()) return null;
+  const sentences = splitSentencesRussian(text);
+  const numSentences = sentences.length;
+  if (numSentences === 0) return null;
+  const words = extractRussianWords(text);
+  const numWords = words.length;
+  if (numWords === 0) return null;
+  const numLongWords = words.reduce((acc, w) => (w.length > 6 ? acc + 1 : acc), 0);
+  try {
+    const lix = numWords / numSentences + 100 * (numLongWords / numWords);
+    return Math.round(lix * 1000) / 1000;
+  } catch (e) {
+    return null;
+  }
+}
+
+function normalizeScore(value, min, max) {
+  if (value === null || value === undefined || !isFinite(value)) return NaN;
+  const clipped = Math.min(Math.max(value, min), max);
+  if (max === min) return 0;
+  return Math.round(((clipped - min) / (max - min)) * 1000) / 1000;
+}
+
+function calculateComplexity(lix, smog, smogValid) {
+  const SCALE_LIX = [0, 80];
+  const SCALE_SMOG = [3, 20];
+  const nLix = normalizeScore(lix, SCALE_LIX[0], SCALE_LIX[1]);
+  const nSmog = smogValid ? normalizeScore(smog, SCALE_SMOG[0], SCALE_SMOG[1]) : NaN;
+  const vals = [];
+  if (!isNaN(nLix)) vals.push(nLix);
+  if (!isNaN(nSmog)) vals.push(nSmog);
+  if (vals.length === 0) return 0; // fallback
+  const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+  return Math.round(avg * 1000) / 1000;
 }
 
 // Convert a numeric ratio (0‑1) into a pastel hue. A low ratio maps to red and
@@ -137,6 +222,19 @@ function interpolateColor(hex1, hex2, t) {
   const g = Math.round(c1.g + (c2.g - c1.g) * t);
   const b = Math.round(c1.b + (c2.b - c1.b) * t);
   return rgbToHex({ r, g, b });
+}
+
+// Parse CSS color string (#hex or rgb/rgba) to {r,g,b}
+function cssColorToRgb(color) {
+  if (!color) return { r: 255, g: 255, b: 255 };
+  const c = color.trim();
+  if (c.startsWith('#')) return hexToRgb(c);
+  const m = c.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+  if (m) {
+    return { r: parseInt(m[1], 10), g: parseInt(m[2], 10), b: parseInt(m[3], 10) };
+  }
+  // Fallback to white
+  return { r: 255, g: 255, b: 255 };
 }
 
 /**
@@ -313,25 +411,17 @@ class TQAView extends ItemView {
     }
     metrics.forEach((m, idx) => {
       const card = this.cardsContainer.createDiv({ cls: 'tqa-card' });
-      // Title
-      card.createEl('h4', { text: `Paragraph ${idx + 1}` });
-      // Snippet
+      // Snippet only (no heading)
       const snippet = paragraphs[idx].length > 200 ? paragraphs[idx].slice(0, 200) + '…' : paragraphs[idx];
       card.createEl('p', { text: snippet });
-      // Metrics list
-      const list = card.createEl('ul');
-      list.createEl('li', { text: `Signal‑to‑noise: ${m.snr.toFixed(2)}` });
-      list.createEl('li', { text: `Complexity: ${m.complexity.toFixed(2)}` });
-      // Show semantic role if available
-      if (m.role && m.role.trim()) {
-        list.createEl('li', { text: `Role: ${m.role}` });
-      }
-      // Link to jump to the paragraph in the editor
-      const link = card.createEl('a', { text: 'Go to paragraph', href: '#' });
-      link.onclick = (ev) => {
-        ev.preventDefault();
-        this.jumpToParagraph(idx);
-      };
+      // Metrics in one compact line
+      const parts = [
+        `Signal‑to‑noise: ${m.snr.toFixed(2)}`,
+        `Complexity: ${m.complexity.toFixed(2)}`
+      ];
+      if (m.role && m.role.trim()) parts.push(`Role: ${m.role}`);
+      card.createEl('p', { text: parts.join('  •  ') });
+      // No "Go to paragraph" link per request
     });
   }
 
@@ -469,21 +559,8 @@ class TQASettingTab extends PluginSettingTab {
 
     // Colour pickers for signal-to-noise gradient (background)
     new Setting(containerEl)
-      .setName('Signal/Noise colours')
-      .setDesc('Choose gradient colours for background (topic closeness). Left: far, Right: close')
-      .addColorPicker((picker) => {
-        picker.setValue(this.plugin.settings.snrMinColor || '#f9d1d1');
-        picker.onChange(async (value) => {
-          this.plugin.settings.snrMinColor = value;
-          await this.plugin.saveSettings();
-          // Refresh decorations on-the-fly when colour changes
-          this.plugin.metricsVersion = (this.plugin.metricsVersion || 0) + 1;
-          try {
-            const cm = this.app.workspace.getActiveViewOfType(MarkdownView)?.editor?.cm;
-            if (cm && typeof cm.dispatch === 'function') cm.dispatch({ effects: [] });
-          } catch (e) {}
-        });
-      })
+      .setName('SNR highlight colour (max)')
+      .setDesc('Choose the background colour used for SNR=1. SNR=0 uses the editor default background.')
       .addColorPicker((picker) => {
         picker.setValue(this.plugin.settings.snrMaxColor || '#d1f9d1');
         picker.onChange(async (value) => {
@@ -658,13 +735,12 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
           let paraIdx = 0;
           let currentLines = [];
 
-          // Normalisation across all paragraphs: map min->0, max->1
-          const snrValues = (metrics || []).map((m) => (typeof m.snr === 'number' ? m.snr : 0));
-          const complexityValues = (metrics || []).map((m) => (typeof m.complexity === 'number' ? m.complexity : 0));
-          const snrMin = snrValues.length ? Math.min(...snrValues) : 0;
-          const snrMax = snrValues.length ? Math.max(...snrValues) : 1;
-          const compMin = complexityValues.length ? Math.min(...complexityValues) : 0;
-          const compMax = complexityValues.length ? Math.max(...complexityValues) : 1;
+          // Normalisation across all paragraphs, but stable within last analysis
+          let snrMin = 0, snrMax = 1, compMin = 0, compMax = 1;
+          if (plugin.metricsCache && plugin.metricsCache.ranges) {
+            const r = plugin.metricsCache.ranges;
+            snrMin = r.snrMin; snrMax = r.snrMax; compMin = r.compMin; compMax = r.compMax;
+          }
           const normalize = (value, min, max) => {
             const range = max - min;
             if (!isFinite(range) || range <= 1e-9) return 0.5; // all equal → mid colour
@@ -720,7 +796,40 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
         }
 
         update(update) {
-          // Recompute when the document changes or when plugin metricsVersion changed
+          // When document changes, update complexity on-the-fly for all paragraphs
+          if (update.docChanged) {
+            const file = plugin.app.workspace.getActiveFile();
+            if (file) {
+              const state = this.view.state;
+              const text = state.doc.toString();
+              const paragraphs = splitIntoParagraphs(text);
+
+              // Build new metrics array, preserving previous SNR where possible
+              const prev = plugin.metricsCache && plugin.metricsCache.file === file.path ? plugin.metricsCache : null;
+              const newMetrics = new Array(paragraphs.length);
+              for (let i = 0; i < paragraphs.length; i++) {
+                const smogInfo = russianSmogIndex(paragraphs[i]);
+                const lix = russianLixIndex(paragraphs[i]);
+                const complexity = calculateComplexity(lix, smogInfo.value, smogInfo.valid);
+                const prevItem = prev && prev.metrics && prev.metrics[i] ? prev.metrics[i] : { snr: 0, topic: 0, role: '' };
+                newMetrics[i] = {
+                  snr: typeof prevItem.snr === 'number' ? prevItem.snr : 0,
+                  complexity,
+                  topic: typeof prevItem.topic === 'number' ? prevItem.topic : 0,
+                  role: prevItem.role || ''
+                };
+              }
+
+              // Preserve previously analysed SNR/topic/role and ranges to keep colours stable
+              const ranges = prev && prev.ranges ? prev.ranges : null;
+              plugin.metricsCache = ranges
+                ? { file: file.path, metrics: newMetrics, paragraphs, ranges }
+                : { file: file.path, metrics: newMetrics, paragraphs };
+              plugin.metricsVersion = (plugin.metricsVersion || 0) + 1;
+            }
+          }
+
+          // Recompute decorations when metricsVersion changed or doc changed
           if (update.docChanged || (this._lastMetricsVersion !== plugin.metricsVersion)) {
             this._lastMetricsVersion = plugin.metricsVersion;
             this.computeDecorations();
@@ -744,7 +853,16 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
     const text = await this.app.vault.read(file);
     const paragraphs = splitIntoParagraphs(text);
     const metrics = await this.getMetrics(paragraphs);
-    this.metricsCache = { file: file.path, metrics, paragraphs };
+    // Persist ranges for stable colouring between live edits
+    const snrValues = (metrics || []).map((m) => (typeof m.snr === 'number' ? m.snr : 0));
+    const compValues = (metrics || []).map((m) => (typeof m.complexity === 'number' ? m.complexity : 0));
+    const ranges = {
+      snrMin: snrValues.length ? Math.min(...snrValues) : 0,
+      snrMax: snrValues.length ? Math.max(...snrValues) : 1,
+      compMin: compValues.length ? Math.min(...compValues) : 0,
+      compMax: compValues.length ? Math.max(...compValues) : 1
+    };
+    this.metricsCache = { file: file.path, metrics, paragraphs, ranges };
     // Signal to the editor decoration plugin that metrics have changed
     this.metricsVersion = (this.metricsVersion || 0) + 1;
     // Refresh decorations immediately after computing metrics
@@ -816,8 +934,13 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
         const subject = topic && topic.trim().length > 0 ? topic : paragraphs[0] || '';
         // Request embeddings for the subject and all paragraphs at once
         const texts = [subject, ...paragraphs];
-        const embs = await fetchOpenAiEmbeddings(apiKey, embeddingModel || 'text-embedding-ada-002', texts);
+        const modelName = embeddingModel || 'text-embedding-ada-002';
+        const embs = await fetchOpenAiEmbeddings(apiKey, modelName, texts);
         const subjectEmb = embs[0];
+        // Cache subject embedding for incremental SNR updates
+        try {
+          this._subjectEmbeddingCache = { text: subject, model: modelName, embedding: subjectEmb };
+        } catch (e) {}
         const paraEmbs = embs.slice(1);
         // Compute complexity via heuristics for each paragraph (reuse computeHeuristicMetrics to get complexity)
         const heurMetrics = computeHeuristicMetrics(paragraphs, '');
@@ -877,6 +1000,67 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
     }
     // Default fallback
     return computeHeuristic();
+  }
+
+  /**
+   * Recompute SNR (and topic/role where applicable) for a subset of paragraph indices.
+   * Returns a map index->snr. Uses the currently selected backend mode, but limits
+   * computation only to requested paragraphs to keep it light on Enter.
+   */
+  async recomputeSnrForIndices(paragraphs, indices) {
+    const uniqIndices = Array.from(new Set(indices.filter((i) => i >= 0 && i < paragraphs.length)));
+    if (uniqIndices.length === 0) return {};
+    const result = {};
+    const { backendMode, httpEndpoint, topic, apiKey, embeddingModel } = this.settings;
+    try {
+      if (backendMode === 'server') {
+        const bodyParagraphs = uniqIndices.map((i) => paragraphs[i]);
+        const res = await fetch(httpEndpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ paragraphs: bodyParagraphs, topic })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          for (let k = 0; k < uniqIndices.length; k++) {
+            const i = uniqIndices[k];
+            const item = data[k] || {};
+            result[i] = typeof item.snr === 'number' ? item.snr : 0;
+          }
+          return result;
+        }
+      } else if (backendMode === 'openai' || (backendMode === 'auto' && apiKey)) {
+        const subject = topic && topic.trim().length > 0 ? topic : paragraphs[0] || '';
+        const modelName = embeddingModel || 'text-embedding-ada-002';
+        // Reuse cached subject embedding if text+model unchanged
+        let subjectEmb;
+        if (this._subjectEmbeddingCache && this._subjectEmbeddingCache.text === subject && this._subjectEmbeddingCache.model === modelName) {
+          subjectEmb = this._subjectEmbeddingCache.embedding;
+        } else {
+          const subjEmb = await fetchOpenAiEmbeddings(apiKey, modelName, [subject]);
+          subjectEmb = subjEmb[0];
+          try { this._subjectEmbeddingCache = { text: subject, model: modelName, embedding: subjectEmb }; } catch (e) {}
+        }
+        const texts = uniqIndices.map((i) => paragraphs[i]);
+        const paraEmbs = await fetchOpenAiEmbeddings(apiKey, modelName, texts);
+        for (let k = 0; k < uniqIndices.length; k++) {
+          const i = uniqIndices[k];
+          const sim = cosineSimilarity(subjectEmb, paraEmbs[k]);
+          result[i] = sim;
+        }
+        return result;
+      }
+    } catch (e) {
+      // fall through to heuristic below
+    }
+    // Heuristic fallback per requested indices
+    for (const i of uniqIndices) {
+      const words = paragraphs[i].split(/\s+/).filter((w) => w.length > 0);
+      const cleaned = words.map((w) => w.replace(/[^\p{L}\p{N}]+/gu, '').toLowerCase().trim());
+      const uniq = new Set(cleaned.filter((w) => w.length > 0));
+      result[i] = words.length > 0 ? uniq.size / words.length : 0;
+    }
+    return result;
   }
 
   /**
@@ -941,9 +1125,25 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
    */
   getBackgroundColorFor(snr) {
     const t = Math.max(0, Math.min(1, snr || 0));
-    const minC = this.settings.snrMinColor || DEFAULT_SETTINGS.snrMinColor || '#f9d1d1';
     const maxC = this.settings.snrMaxColor || DEFAULT_SETTINGS.snrMaxColor || '#d1f9d1';
-    return interpolateColor(minC, maxC, t);
+    // Strict gradient: from theme background color to maxC.
+    // Try to read CSS var --background-primary; fall back to computed style or a safe default.
+    let baseColorHex = '#ffffff';
+    try {
+      const rootStyle = getComputedStyle(document.body);
+      const varColor = rootStyle.getPropertyValue('--background-primary').trim();
+      if (varColor) {
+        const rgb = cssColorToRgb(varColor);
+        baseColorHex = rgbToHex(rgb);
+      } else {
+        // try reading editor element background
+        const editorEl = document.querySelector('.cm-editor');
+        const bg = editorEl ? getComputedStyle(editorEl).backgroundColor : null;
+        if (bg) baseColorHex = rgbToHex(cssColorToRgb(bg));
+      }
+    } catch (e) {}
+    // Inverted mapping: high SNR → closer to theme background; low SNR → closer to selected colour
+    return interpolateColor(maxC, baseColorHex, t);
   }
 
   /**
