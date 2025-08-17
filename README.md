@@ -6,13 +6,12 @@ provides two core features:
 
 1. **Inline highlighting** in the editor: each paragraph is coloured according to
    its signal‑to‑noise ratio (background colour) and complexity (text colour).
-   Green backgrounds indicate a higher ratio of unique tokens, while red
-   backgrounds hint at repetitiveness. Darker text denotes more complex
-   language.
+   The background forms a strict gradient from the editor's theme background
+   (high SNR) towards a user‑selected highlight colour (low SNR). Text colour
+   follows a gradient between two user‑selected colours based on complexity.
 
 2. **Cards view**: a dedicated pane lists all paragraphs in the current note,
-   summarising their metrics (signal‑to‑noise, complexity and semantic role) and
-   allowing quick navigation back into the editor.
+   summarising their metrics (signal‑to‑noise, complexity and semantic role).
 
 The analysis can be performed in several ways:
 
@@ -26,7 +25,7 @@ See the Settings section below for details on configuring these modes.
 Installation
 ------------
 
-1. Copy the entire `text-quality-analyzer-plugin` folder into your vault’s
+1. Copy the entire `text‑quality‑analyzer` folder into your vault’s
    `.obsidian/plugins` directory. After installation the directory structure
    should look like this:
 
@@ -74,8 +73,10 @@ Open a Markdown note in edit mode and run the command **Analyze Current Note**
 from the command palette (press <kbd>Ctrl</kbd>+<kbd>P</kbd> then type the
 command name). Paragraphs will be highlighted immediately. To see metrics in a
 list, run **Open Text Quality Cards**. The card view appears in a side pane
-listing each paragraph, its signal‑to‑noise ratio, complexity and topic match.
-Click **Go to paragraph** on any card to jump back into the editor.
+listing each paragraph with its signal‑to‑noise ratio, complexity and (when
+available) semantic role.
+
+Tip: a ribbon icon in the left sidebar opens the plugin settings.
 
 Settings
 --------
@@ -96,9 +97,9 @@ Open *Settings → Community Plugins → Text Quality Analyzer* to configure:
 
 * **Chat model** — the OpenAI model used for semantic role classification (default: `gpt-3.5-turbo`).
 
-* **Topic** — an optional phrase to measure how closely each paragraph matches your intended subject. A higher topic match indicates that the paragraph contains this phrase more frequently.
+* **Topic** — an optional phrase to measure how closely each paragraph matches your intended subject. When using OpenAI, SNR is derived as cosine similarity between the topic (or the first paragraph when topic is empty) and paragraph embeddings.
 
-* **Signal/Noise colours** — choose two colours to define the gradient for background highlighting. The left picker corresponds to paragraphs far from the topic (low signal), and the right picker corresponds to paragraphs close to the topic (high signal).
+* **Signal/Noise colour** — choose the highlight colour for low SNR. The background interpolates from the editor’s theme background (high SNR) to this colour (low SNR).
 
 * **Complexity colours** — choose two colours to define the gradient for text colour. The left picker corresponds to simple paragraphs, and the right picker corresponds to complex paragraphs.
 
@@ -107,8 +108,19 @@ Notes
 
 * Paragraphs are defined as blocks of text separated by one or more blank
   lines.
-* The local heuristic uses the ratio of unique tokens to total words (signal
-  to noise) and the proportion of long words (>6 letters) as proxies for
-  complexity. These scores are normalised between 0 and 1.
+* SNR (signal‑to‑noise): heuristics use the ratio of unique tokens to total
+  words; OpenAI mode uses cosine similarity between paragraph and the topic (or
+  the first paragraph when topic is empty).
+* Complexity: computed locally as a combination of LIX and SMOG indices for
+  Russian text (SMOG contributes only when there are ≥3 sentences). Both scores
+  are normalised to [0,1].
 * Colour gradients are produced on the fly without requiring additional CSS.
 * When using the HTTP server or OpenAI modes, the plugin automatically falls back to heuristics if the server is unreachable, the API key is missing, or the external calls fail.
+
+Live vs. on‑demand
+------------------
+
+* Complexity is updated live as you edit.
+* SNR and semantic roles are recomputed on demand via **Analyze Current Note**
+  (and automatically when a file is opened). Colour pickers in settings apply
+  immediately.
