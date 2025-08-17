@@ -476,6 +476,12 @@ class TQASettingTab extends PluginSettingTab {
         picker.onChange(async (value) => {
           this.plugin.settings.snrMinColor = value;
           await this.plugin.saveSettings();
+          // Refresh decorations on-the-fly when colour changes
+          this.plugin.metricsVersion = (this.plugin.metricsVersion || 0) + 1;
+          try {
+            const cm = this.app.workspace.getActiveViewOfType(MarkdownView)?.editor?.cm;
+            if (cm && typeof cm.dispatch === 'function') cm.dispatch({ effects: [] });
+          } catch (e) {}
         });
       })
       .addColorPicker((picker) => {
@@ -483,6 +489,11 @@ class TQASettingTab extends PluginSettingTab {
         picker.onChange(async (value) => {
           this.plugin.settings.snrMaxColor = value;
           await this.plugin.saveSettings();
+          this.plugin.metricsVersion = (this.plugin.metricsVersion || 0) + 1;
+          try {
+            const cm = this.app.workspace.getActiveViewOfType(MarkdownView)?.editor?.cm;
+            if (cm && typeof cm.dispatch === 'function') cm.dispatch({ effects: [] });
+          } catch (e) {}
         });
       });
 
@@ -495,6 +506,11 @@ class TQASettingTab extends PluginSettingTab {
         picker.onChange(async (value) => {
           this.plugin.settings.complexityMinColor = value;
           await this.plugin.saveSettings();
+          this.plugin.metricsVersion = (this.plugin.metricsVersion || 0) + 1;
+          try {
+            const cm = this.app.workspace.getActiveViewOfType(MarkdownView)?.editor?.cm;
+            if (cm && typeof cm.dispatch === 'function') cm.dispatch({ effects: [] });
+          } catch (e) {}
         });
       })
       .addColorPicker((picker) => {
@@ -502,6 +518,11 @@ class TQASettingTab extends PluginSettingTab {
         picker.onChange(async (value) => {
           this.plugin.settings.complexityMaxColor = value;
           await this.plugin.saveSettings();
+          this.plugin.metricsVersion = (this.plugin.metricsVersion || 0) + 1;
+          try {
+            const cm = this.app.workspace.getActiveViewOfType(MarkdownView)?.editor?.cm;
+            if (cm && typeof cm.dispatch === 'function') cm.dispatch({ effects: [] });
+          } catch (e) {}
         });
       });
   }
@@ -518,6 +539,10 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
     // Persist any changes from .env loading
     await this.saveSettings();
     this.metricsCache = null;
+    // Version counter for metrics; increments every time metrics are recomputed.
+    // Used by the editor decoration plugin to know when to refresh colours
+    // even if the document text itself did not change.
+    this.metricsVersion = 0;
     // Register the custom view type
     this.registerView(VIEW_TYPE, (leaf) => new TQAView(leaf, this));
     // Register the settings tab
@@ -541,6 +566,23 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
     this.registerEvent(this.app.workspace.on('file-open', () => {
       this.reanalyze();
     }));
+
+    // Add a ribbon icon on the left to quickly open this plugin's settings
+    this.ribbonIconEl = this.addRibbonIcon(
+      'lines-of-text',
+      'Text Quality Analyzer: Open Settings',
+      () => {
+        try {
+          this.app.setting.open();
+          // Navigate directly to this plugin's tab if available
+          if (typeof this.app.setting.openTabById === 'function') {
+            this.app.setting.openTabById(this.manifest.id);
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+    );
   }
 
   onunload() {
@@ -584,8 +626,13 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
           // Skip processing if no file is open (e.g. the welcome screen)
           if (!file) {
             this.decorations = Decoration.none;
-            this.view.update([]);
             return;
+          }
+          // If metrics are not computed yet, request them and exit; the plugin
+          // will bump metricsVersion and we will recompute on the next update.
+          if (!plugin.metricsCache || plugin.metricsCache.file !== file.path) {
+            // Fire and forget; no await to avoid recursion in updates
+            plugin.reanalyze();
           }
           const paragraphs = splitIntoParagraphs(docText);
           // Acquire metrics: use cached metrics if the same number of paragraphs
@@ -610,15 +657,31 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
           const totalLines = state.doc.lines;
           let paraIdx = 0;
           let currentLines = [];
+
+          // Normalisation across all paragraphs: map min->0, max->1
+          const snrValues = (metrics || []).map((m) => (typeof m.snr === 'number' ? m.snr : 0));
+          const complexityValues = (metrics || []).map((m) => (typeof m.complexity === 'number' ? m.complexity : 0));
+          const snrMin = snrValues.length ? Math.min(...snrValues) : 0;
+          const snrMax = snrValues.length ? Math.max(...snrValues) : 1;
+          const compMin = complexityValues.length ? Math.min(...complexityValues) : 0;
+          const compMax = complexityValues.length ? Math.max(...complexityValues) : 1;
+          const normalize = (value, min, max) => {
+            const range = max - min;
+            if (!isFinite(range) || range <= 1e-9) return 0.5; // all equal → mid colour
+            const t = (value - min) / range;
+            return Math.max(0, Math.min(1, t));
+          };
           for (let lineNumber = 1; lineNumber <= totalLines; lineNumber++) {
             const line = state.doc.line(lineNumber).text;
             if (line.trim() === '') {
               if (currentLines.length > 0) {
                 if (metrics[paraIdx]) {
                   const { snr, complexity } = metrics[paraIdx];
-                  // Use plugin-defined colour functions to interpolate between user-chosen colours
-                  const bg = plugin.getBackgroundColorFor(snr);
-                  const fg = plugin.getTextColorFor(complexity);
+                  // Normalise colours per current analysis
+                  const normSnr = normalize(snr, snrMin, snrMax);
+                  const normComplexity = normalize(complexity, compMin, compMax);
+                  const bg = plugin.getBackgroundColorFor(normSnr);
+                  const fg = plugin.getTextColorFor(normComplexity);
                   currentLines.forEach((ln) => {
                     const range = state.doc.line(ln);
                     const deco = Decoration.line({
@@ -639,8 +702,10 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
           // handle trailing paragraph
           if (currentLines.length > 0 && metrics[paraIdx]) {
             const { snr, complexity } = metrics[paraIdx];
-            const bg = plugin.getBackgroundColorFor(snr);
-            const fg = plugin.getTextColorFor(complexity);
+            const normSnr = normalize(snr, snrMin, snrMax);
+            const normComplexity = normalize(complexity, compMin, compMax);
+            const bg = plugin.getBackgroundColorFor(normSnr);
+            const fg = plugin.getTextColorFor(normComplexity);
             currentLines.forEach((ln) => {
               const range = state.doc.line(ln);
               const deco = Decoration.line({
@@ -652,11 +717,12 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
             });
           }
           this.decorations = builder.finish();
-          this.view.update([]);
         }
 
         update(update) {
-          if (update.docChanged) {
+          // Recompute when the document changes or when plugin metricsVersion changed
+          if (update.docChanged || (this._lastMetricsVersion !== plugin.metricsVersion)) {
+            this._lastMetricsVersion = plugin.metricsVersion;
             this.computeDecorations();
           }
         }
@@ -679,6 +745,8 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
     const paragraphs = splitIntoParagraphs(text);
     const metrics = await this.getMetrics(paragraphs);
     this.metricsCache = { file: file.path, metrics, paragraphs };
+    // Signal to the editor decoration plugin that metrics have changed
+    this.metricsVersion = (this.metricsVersion || 0) + 1;
     // Refresh decorations immediately after computing metrics
     if (this.decorationsExtension && this.decorationsExtension.value) {
       const view = this.app.workspace.getActiveViewOfType(MarkdownView)?.editor?.cm;
@@ -686,6 +754,8 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
       // by dispatching a no‑op transaction. If cm is undefined (older versions),
       // decorations will update on the next edit.
       try {
+        // Trigger a lightweight update; decorations plugin will also detect
+        // the metricsVersion change and recompute colours.
         view.dispatch({ effects: [] });
       } catch (e) {
         // ignore
