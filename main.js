@@ -20,7 +20,8 @@ const {
 
 // CodeMirror imports. These are provided by Obsidian's internal bundles.
 const { ViewPlugin, Decoration } = require('@codemirror/view');
-const { RangeSetBuilder } = require('@codemirror/state');
+const { RangeSetBuilder, Annotation } = require('@codemirror/state');
+const RefreshAnnotation = Annotation.define();
 
 // Default settings for the plugin. Users can override these in the settings tab.
 const DEFAULT_SETTINGS = {
@@ -38,16 +39,22 @@ const DEFAULT_SETTINGS = {
   topic: '',
   /** API key used when invoking embedding and chat models directly. */
   apiKey: '',
-  /** Name of the embedding model to use (e.g. text-embedding-ada-002). */
-  embeddingModel: 'text-embedding-ada-002',
+  /** Name of the embedding model to use (default: text-embedding-3-small). */
+  embeddingModel: 'text-embedding-3-small',
   /** Name of the chat model used for semantic role classification. */
   chatModel: 'gpt-3.5-turbo',
+  /** Whether to request semantic role classification from LLM. */
+  classifyRoles: false,
+  /** Method for SNR computation in OpenAI mode: 'embedding' | 'llm' */
+  snrMethod: 'embedding',
   /** Color used for the maximum signal‑to‑noise intensity (1.0). */
   snrMaxColor: '#d1f9d1',
   /** Color used for the lowest complexity (simple text). Represented as a CSS hex string. */
   complexityMinColor: '#cccccc',
   /** Color used for the highest complexity (complex text). Represented as a CSS hex string. */
-  complexityMaxColor: '#4c4c4c'
+  complexityMaxColor: '#4c4c4c',
+  /** If true, map per-note min→0 and max→1 for SNR and Complexity when colouring. */
+  normalizeRanges: true
 };
 
 // Helper function to split a note into paragraphs. Blank lines separate paragraphs.
@@ -238,9 +245,78 @@ function cssColorToRgb(color) {
 }
 
 /**
+ * Robust wrapper for OpenAI chat completions that adapts to models which
+ * require 'max_completion_tokens' instead of 'max_tokens' (e.g. gpt‑5 family).
+ * Returns parsed JSON body.
+ */
+async function callOpenAiChat(apiKey, model, messages, options = {}) {
+  const { temperature = 0, maxTokens = undefined, responseFormat = undefined } = options;
+  const endpoint = 'https://api.openai.com/v1/chat/completions';
+  const baseHeaders = { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
+  const prefersCompletionTokens = /gpt-5/i.test(model || '');
+  const baseBody = { model, messages };
+  // gpt-5 family не поддерживает произвольную температуру — используем значение по умолчанию (не передаём параметр)
+  if (!prefersCompletionTokens && typeof temperature === 'number') baseBody.temperature = temperature;
+  if (responseFormat) baseBody.response_format = responseFormat;
+
+  // Choose token field based on model family
+  const body1 = Object.assign({}, baseBody);
+  if (typeof maxTokens === 'number') {
+    if (prefersCompletionTokens) body1.max_completion_tokens = maxTokens;
+    else body1.max_tokens = maxTokens;
+  }
+  let res = await fetch(endpoint, { method: 'POST', headers: baseHeaders, body: JSON.stringify(body1) });
+  if (res.ok) return await res.json();
+  // Inspect error to decide retry
+  let errText = '';
+  try { errText = await res.text(); } catch (e) {}
+  let shouldRetry = false;
+  try {
+    const errJson = JSON.parse(errText);
+    const msg = errJson?.error?.message || '';
+    const param = errJson?.error?.param || '';
+    if (param === 'max_tokens' || param === 'max_completion_tokens' || msg.toLowerCase().includes('max_tokens') || msg.toLowerCase().includes('max_completion_tokens')) {
+      shouldRetry = true;
+    }
+  } catch (e) {
+    // If we cannot parse, still try retry path for gpt‑5 models heuristically
+    if ((model || '').includes('gpt-5')) shouldRetry = true;
+  }
+  if (!shouldRetry) {
+    console.error('TQA: chat completion error (no retry)', res.status, res.statusText, errText);
+    throw new Error('Chat completion failed');
+  }
+  // Second attempt with max_completion_tokens
+  const body2 = Object.assign({}, baseBody);
+  if (typeof maxTokens === 'number') body2.max_completion_tokens = prefersCompletionTokens ? undefined : maxTokens;
+  if (typeof maxTokens === 'number') body2.max_tokens = prefersCompletionTokens ? undefined : body2.max_tokens;
+  // Flip fields explicitly
+  if (typeof maxTokens === 'number') {
+    if (prefersCompletionTokens) {
+      body2.max_tokens = maxTokens; // try the other field
+      delete body2.max_completion_tokens;
+    } else {
+      body2.max_completion_tokens = maxTokens;
+      delete body2.max_tokens;
+    }
+  }
+  new Notice('Chat model token parameter adjusted; retrying request.');
+  res = await fetch(endpoint, { method: 'POST', headers: baseHeaders, body: JSON.stringify(body2) });
+  if (!res.ok) {
+    let err2 = '';
+    try { err2 = await res.text(); } catch (e) {}
+    console.error('TQA: chat completion retry failed', res.status, res.statusText, err2);
+    throw new Error('Chat completion failed');
+  }
+  return await res.json();
+}
+
+// Responses API support for gpt-5 has been removed due to instability.
+
+/**
  * Request vector embeddings for an array of texts via the OpenAI API. The
  * returned embeddings are arrays of floats. If the API call fails, an error
- * will be thrown. The model name must be specified (e.g. 'text-embedding-ada-002').
+ * will be thrown. The model name must be specified (e.g. 'text-embedding-3-small').
  *
  * @param {string} apiKey  The API key used for authorization.
  * @param {string} model   The name of the embedding model.
@@ -534,26 +610,68 @@ class TQASettingTab extends PluginSettingTab {
     // Embedding model selector
     new Setting(containerEl)
       .setName('Embedding model')
-      .setDesc('Name of the embedding model (e.g. text-embedding-ada-002).')
+      .setDesc('Name of the embedding model (e.g. text-embedding-3-small).')
       .addText((text) => {
-        text.setPlaceholder('text-embedding-ada-002');
-        text.setValue(this.plugin.settings.embeddingModel || 'text-embedding-ada-002');
+        text.setPlaceholder('text-embedding-3-small');
+        text.setValue(this.plugin.settings.embeddingModel || 'text-embedding-3-small');
         text.onChange(async (value) => {
-          this.plugin.settings.embeddingModel = value.trim() || 'text-embedding-ada-002';
+          this.plugin.settings.embeddingModel = value.trim() || 'text-embedding-3-small';
           await this.plugin.saveSettings();
+          // Changing the embedding model should invalidate caches and re-run analysis
+          if (typeof this.plugin.resetAnalysisCache === 'function') {
+            this.plugin.resetAnalysisCache(true);
+          }
         });
       });
 
     // Chat model selector
     new Setting(containerEl)
       .setName('Chat model')
-      .setDesc('Name of the model for semantic role classification (e.g. gpt-3.5-turbo).')
-      .addText((text) => {
-        text.setPlaceholder('gpt-3.5-turbo');
-        text.setValue(this.plugin.settings.chatModel || 'gpt-3.5-turbo');
-        text.onChange(async (value) => {
-          this.plugin.settings.chatModel = value.trim() || 'gpt-3.5-turbo';
+      .setDesc('Model for semantic role classification and LLM SNR scoring.')
+      .addDropdown((dropdown) => {
+        const options = {
+          'gpt-3.5-turbo': 'gpt-3.5-turbo',
+          'gpt-4o-mini': 'gpt-4o-mini',
+          'gpt-4o': 'gpt-4o'
+        };
+        Object.entries(options).forEach(([k, v]) => dropdown.addOption(k, v));
+        dropdown.setValue(this.plugin.settings.chatModel || 'gpt-3.5-turbo');
+        dropdown.onChange(async (value) => {
+          this.plugin.settings.chatModel = value;
           await this.plugin.saveSettings();
+          if (typeof this.plugin.resetAnalysisCache === 'function') {
+            this.plugin.resetAnalysisCache(true);
+          }
+        });
+      });
+
+    // Toggle: classify semantic roles
+    new Setting(containerEl)
+      .setName('Classify semantic roles')
+      .setDesc('If enabled, the plugin will call the chat model to classify the semantic role of each paragraph (OpenAI/Auto modes only).')
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.classifyRoles ?? false);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.classifyRoles = value;
+          await this.plugin.saveSettings();
+          if (typeof this.plugin.resetAnalysisCache === 'function') {
+            this.plugin.resetAnalysisCache(true);
+          }
+        });
+      });
+
+    // SNR method selector (OpenAI mode only)
+    new Setting(containerEl)
+      .setName('SNR method (OpenAI)')
+      .setDesc("Choose how to compute SNR in OpenAI mode: embeddings cosine similarity or direct LLM scoring vs topic.")
+      .addDropdown((dropdown) => {
+        dropdown.addOption('embedding', 'Embeddings (cosine)');
+        dropdown.addOption('llm', 'LLM scoring');
+        dropdown.setValue(this.plugin.settings.snrMethod || 'embedding');
+        dropdown.onChange(async (value) => {
+          this.plugin.settings.snrMethod = value;
+          await this.plugin.saveSettings();
+          if (typeof this.plugin.resetAnalysisCache === 'function') this.plugin.resetAnalysisCache(true);
         });
       });
 
@@ -565,6 +683,23 @@ class TQASettingTab extends PluginSettingTab {
         picker.setValue(this.plugin.settings.snrMaxColor || '#d1f9d1');
         picker.onChange(async (value) => {
           this.plugin.settings.snrMaxColor = value;
+          await this.plugin.saveSettings();
+          this.plugin.metricsVersion = (this.plugin.metricsVersion || 0) + 1;
+          try {
+            const cm = this.app.workspace.getActiveViewOfType(MarkdownView)?.editor?.cm;
+            if (cm && typeof cm.dispatch === 'function') cm.dispatch({ effects: [] });
+          } catch (e) {}
+        });
+      });
+
+    // Toggle: normalise ranges when colouring
+    new Setting(containerEl)
+      .setName('Normalise ranges for colouring')
+      .setDesc('If enabled, per-note min values map to 0 and max values map to 1 for SNR and Complexity when computing colours. If disabled, raw metric values are used as-is (may exceed [0,1]).')
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.normalizeRanges ?? true);
+        toggle.onChange(async (value) => {
+          this.plugin.settings.normalizeRanges = value;
           await this.plugin.saveSettings();
           this.plugin.metricsVersion = (this.plugin.metricsVersion || 0) + 1;
           try {
@@ -620,6 +755,8 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
     // Used by the editor decoration plugin to know when to refresh colours
     // even if the document text itself did not change.
     this.metricsVersion = 0;
+    this._subjectEmbeddingCache = null;
+    this._statusBarItem = null;
     // Register the custom view type
     this.registerView(VIEW_TYPE, (leaf) => new TQAView(leaf, this));
     // Register the settings tab
@@ -660,6 +797,15 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
         }
       }
     );
+
+    // Create status bar item for background LLM/server analysis
+    this._statusBarItem = this.addStatusBarItem();
+    this._statusBarItem.addClass('tqa-status');
+    this._statusBarItem.setAttr('aria-live', 'polite');
+    this._statusBarItem.style.display = 'none';
+    const spinner = this._statusBarItem.createDiv({ cls: 'tqa-spinner' });
+    const label = this._statusBarItem.createSpan();
+    label.setText('Analyzing…');
   }
 
   onunload() {
@@ -735,13 +881,17 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
           let paraIdx = 0;
           let currentLines = [];
 
-          // Normalisation across all paragraphs, but stable within last analysis
+          // Ranges for normalisation
           let snrMin = 0, snrMax = 1, compMin = 0, compMax = 1;
-          if (plugin.metricsCache && plugin.metricsCache.ranges) {
+          if (plugin.settings.normalizeRanges && plugin.metricsCache && plugin.metricsCache.ranges) {
             const r = plugin.metricsCache.ranges;
             snrMin = r.snrMin; snrMax = r.snrMax; compMin = r.compMin; compMax = r.compMax;
           }
           const normalize = (value, min, max) => {
+            if (!plugin.settings.normalizeRanges) {
+              // clamp raw value to [0,1] for colouring only
+              return Math.max(0, Math.min(1, value || 0));
+            }
             const range = max - min;
             if (!isFinite(range) || range <= 1e-9) return 0.5; // all equal → mid colour
             const t = (value - min) / range;
@@ -830,7 +980,7 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
           }
 
           // Recompute decorations when metricsVersion changed or doc changed
-          if (update.docChanged || (this._lastMetricsVersion !== plugin.metricsVersion)) {
+          if (update.docChanged || update.annotations?.some?.(a => a.type === RefreshAnnotation) || (this._lastMetricsVersion !== plugin.metricsVersion)) {
             this._lastMetricsVersion = plugin.metricsVersion;
             this.computeDecorations();
           }
@@ -852,7 +1002,9 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
     if (!file) return;
     const text = await this.app.vault.read(file);
     const paragraphs = splitIntoParagraphs(text);
-    const metrics = await this.getMetrics(paragraphs);
+    // Show spinner while we may be calling server/LLM
+    this.showBusy(true);
+    const metrics = await this.getMetrics(paragraphs).finally(() => this.showBusy(false));
     // Persist ranges for stable colouring between live edits
     const snrValues = (metrics || []).map((m) => (typeof m.snr === 'number' ? m.snr : 0));
     const compValues = (metrics || []).map((m) => (typeof m.complexity === 'number' ? m.complexity : 0));
@@ -866,19 +1018,7 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
     // Signal to the editor decoration plugin that metrics have changed
     this.metricsVersion = (this.metricsVersion || 0) + 1;
     // Refresh decorations immediately after computing metrics
-    if (this.decorationsExtension && this.decorationsExtension.value) {
-      const view = this.app.workspace.getActiveViewOfType(MarkdownView)?.editor?.cm;
-      // The CodeMirror instance will refresh when doc changes; we manually trigger
-      // by dispatching a no‑op transaction. If cm is undefined (older versions),
-      // decorations will update on the next edit.
-      try {
-        // Trigger a lightweight update; decorations plugin will also detect
-        // the metricsVersion change and recompute colours.
-        view.dispatch({ effects: [] });
-      } catch (e) {
-        // ignore
-      }
-    }
+    this._forceRefreshEditors();
     // Update card view if it is open
     const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
     for (const leaf of leaves) {
@@ -887,6 +1027,42 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
         view.renderMetrics(this.metricsCache);
       }
     }
+  }
+
+  resetAnalysisCache(triggerReanalyze = false) {
+    try {
+      this._subjectEmbeddingCache = null;
+      this.metricsCache = null;
+      this.metricsVersion = (this.metricsVersion || 0) + 1;
+      this._forceRefreshEditors();
+      if (triggerReanalyze) {
+        this.reanalyze();
+      }
+    } catch (e) {}
+  }
+
+  _forceRefreshEditors() {
+    try {
+      // Dispatch a no-op with a custom annotation to all markdown editors
+      const leaves = this.app.workspace.getLeavesOfType('markdown');
+      if (Array.isArray(leaves)) {
+        for (const leaf of leaves) {
+          const cm = leaf?.view?.editor?.cm;
+          if (cm && typeof cm.dispatch === 'function') {
+            cm.dispatch({ annotations: RefreshAnnotation.of(true) });
+          }
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  showBusy(isBusy) {
+    try {
+      if (!this._statusBarItem) return;
+      this._statusBarItem.style.display = isBusy ? '' : 'none';
+    } catch (e) {}
   }
 
   /**
@@ -932,30 +1108,125 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
       try {
         // Determine the topic text: use explicit topic if provided, otherwise use the first paragraph as the subject
         const subject = topic && topic.trim().length > 0 ? topic : paragraphs[0] || '';
-        // Request embeddings for the subject and all paragraphs at once
-        const texts = [subject, ...paragraphs];
-        const modelName = embeddingModel || 'text-embedding-ada-002';
-        const embs = await fetchOpenAiEmbeddings(apiKey, modelName, texts);
-        const subjectEmb = embs[0];
-        // Cache subject embedding for incremental SNR updates
-        try {
-          this._subjectEmbeddingCache = { text: subject, model: modelName, embedding: subjectEmb };
-        } catch (e) {}
-        const paraEmbs = embs.slice(1);
+        const modelName = embeddingModel || 'text-embedding-3-small';
+        // Compute SNR by selected method
+        let snrArray = [];
+        if ((this.settings.snrMethod || 'embedding') === 'embedding') {
+          const texts = [subject, ...paragraphs];
+          const embs = await fetchOpenAiEmbeddings(apiKey, modelName, texts);
+          const subjectEmb = embs[0];
+          try { this._subjectEmbeddingCache = { text: subject, model: modelName, embedding: subjectEmb }; } catch (e) {}
+          const paraEmbs = embs.slice(1);
+          for (let i = 0; i < paraEmbs.length; i++) snrArray.push(cosineSimilarity(subjectEmb, paraEmbs[i]));
+        } else {
+          // LLM scoring method: ask the chat model to rate each paragraph vs topic
+          const messages = [
+            {
+              role: 'system',
+              content:
+                'You are a relevance scorer. Given a TOPIC and a list of N numbered PARAGRAPHS, output only a JSON object with the exact shape {"scores":[s1,...,sN]}. ' +
+                'Each si must be a real number in the closed interval [0,1] (continuous score, e.g., 0.83, 0.41 — not just 0 or 1). ' +
+                'Use plain JSON numbers (no strings, NaN or Infinity), a dot as the decimal separator, and up to 3 decimals. ' +
+                'The array length must be exactly N and preserve the paragraph order. ' +
+                'Do not include the topic itself in the scoring; score only the numbered paragraphs. ' +
+                'Return only the JSON object without code fences or any extra text.'
+            },
+            {
+              role: 'user',
+              content:
+                `Topic: ${subject}\n\nNumber of paragraphs: ${paragraphs.length}\n\nParagraphs (numbered, one per line):\n` +
+                paragraphs.map((p, i) => `${i+1}. ${p}`).join('\n') +
+                `\n\nReturn strictly a JSON object: {"scores":[${'s,'.repeat(paragraphs.length).slice(0,-1)}]}`
+            }
+          ];
+          const modelNameChat = chatModel || 'gpt-3.5-turbo';
+          const useSchema = /gpt-4o|gpt-5/i.test(modelNameChat);
+          const schemaFormat = {
+            type: 'json_schema',
+            json_schema: {
+              name: 'snr_scores',
+              schema: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  scores: {
+                    type: 'array',
+                    items: { type: 'number', minimum: 0, maximum: 1 },
+                    minItems: paragraphs.length,
+                    maxItems: paragraphs.length
+                  }
+                },
+                required: ['scores']
+              }
+            }
+          };
+          const responseFormat = useSchema ? schemaFormat : { type: 'json_object' };
+          let content = '';
+          if (/gpt-5/i.test(modelNameChat)) {
+            // No special handling for gpt-5 anymore; treat as regular chat path
+            const data = await callOpenAiChat(apiKey, modelNameChat, messages, { temperature: 0, responseFormat, maxTokens: 200 });
+            content = data?.choices?.[0]?.message?.content?.trim() || '';
+          } else {
+            const data = await callOpenAiChat(apiKey, modelNameChat, messages, { temperature: 0, responseFormat, maxTokens: 200 });
+            content = data?.choices?.[0]?.message?.content?.trim() || '{}';
+          }
+          try { console.info('TQA: LLM SNR raw response', { model: modelNameChat, content }); } catch (_) {}
+          if (snrArray.length === 0 && content) {
+            try {
+              let parsed = JSON.parse(content);
+              let arr = Array.isArray(parsed?.scores) ? parsed.scores : parsed;
+              if (!Array.isArray(arr)) {
+                // salvage from array text if the model ignored response_format
+                const cleaned = content.replace(/```(?:json)?/g, '').replace(/```/g, '');
+                const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
+                if (arrayMatch) arr = JSON.parse(arrayMatch[0]);
+                else throw new Error('Not an array');
+              }
+              // Coerce values to [0,1] numbers
+              arr = arr.map((x) => (typeof x === 'number' ? Math.max(0, Math.min(1, x)) : 0));
+              // Repair length if needed
+              if (arr.length !== paragraphs.length) {
+                console.warn('TQA: LLM SNR JSON length mismatch or not array', { content, parsed: arr, expected: paragraphs.length });
+                if (arr.length > paragraphs.length) {
+                  arr = arr.slice(0, paragraphs.length);
+                } else if (arr.length < paragraphs.length) {
+                  arr = arr.concat(new Array(paragraphs.length - arr.length).fill(0));
+                }
+              }
+              snrArray = arr;
+            } catch (e) {
+              console.warn('TQA: failed to JSON.parse LLM SNR content', { content, error: e });
+              new Notice('LLM SNR scoring returned invalid JSON; falling back to embeddings.');
+              snrArray = paragraphs.map(() => 0);
+            }
+          }
+          // Fallback to embeddings if all zeros
+          if (snrArray.every((v) => v === 0)) {
+            new Notice('LLM SNR scoring failed to return valid data; falling back to embeddings.');
+            const texts = [subject, ...paragraphs];
+            const embs = await fetchOpenAiEmbeddings(apiKey, modelName, texts);
+            const subjectEmb = embs[0];
+            try { this._subjectEmbeddingCache = { text: subject, model: modelName, embedding: subjectEmb }; } catch (e) {}
+            const paraEmbs = embs.slice(1);
+            snrArray = paraEmbs.map((e) => cosineSimilarity(subjectEmb, e));
+          }
+        }
         // Compute complexity via heuristics for each paragraph (reuse computeHeuristicMetrics to get complexity)
         const heurMetrics = computeHeuristicMetrics(paragraphs, '');
-        // Attempt to fetch semantic roles; if it fails, default to empty string
-        let roles = [];
-        try {
-          roles = await fetchOpenAiRoles(apiKey, chatModel || 'gpt-3.5-turbo', paragraphs);
-        } catch (roleErr) {
-          roles = paragraphs.map(() => '');
+        // Attempt to fetch semantic roles; optional via settings
+        let roles = paragraphs.map(() => '');
+        if (this.settings.classifyRoles) {
+          try {
+            roles = await fetchOpenAiRoles(apiKey, chatModel || 'gpt-3.5-turbo', paragraphs);
+          } catch (roleErr) {
+            roles = paragraphs.map(() => '');
+          }
         }
         const results = [];
         for (let i = 0; i < paragraphs.length; i++) {
-          const sim = cosineSimilarity(subjectEmb, paraEmbs[i]);
+          const snr = snrArray[i] ?? 0;
           const complexity = heurMetrics[i] ? heurMetrics[i].complexity : 0;
-          results.push({ snr: sim, complexity, topic: sim, role: roles[i] });
+          results.push({ snr, complexity, topic: snr, role: roles[i] });
         }
         return results;
       } catch (err) {
@@ -1031,7 +1302,7 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
         }
       } else if (backendMode === 'openai' || (backendMode === 'auto' && apiKey)) {
         const subject = topic && topic.trim().length > 0 ? topic : paragraphs[0] || '';
-        const modelName = embeddingModel || 'text-embedding-ada-002';
+        const modelName = embeddingModel || 'text-embedding-3-small';
         // Reuse cached subject embedding if text+model unchanged
         let subjectEmb;
         if (this._subjectEmbeddingCache && this._subjectEmbeddingCache.text === subject && this._subjectEmbeddingCache.model === modelName) {
