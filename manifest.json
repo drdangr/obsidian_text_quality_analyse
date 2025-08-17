@@ -1,0 +1,10 @@
+{
+  "id": "text-quality-analyzer",
+  "name": "Text Quality Analyzer",
+  "version": "0.0.1",
+  "minAppVersion": "0.15.0",
+  "description": "Highlights paragraphs based on signal‑to‑noise ratio and complexity, and shows a card view of paragraph metrics.",
+  "author": "ChatGPT Assistant",
+  "authorUrl": "https://github.com/drdangr/text_quality_analyzer",
+  "isDesktopOnly": false
+}

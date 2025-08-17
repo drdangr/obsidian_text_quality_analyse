@@ -1,0 +1,36 @@
+/*
+ * Styles for the Text Quality Analyzer plugin. These definitions control the
+ * appearance of the card view. Colours for the editor decorations are set
+ * programmatically in main.js and are not defined here.
+ */
+
+.tqa-cards-view {
+  padding: 1rem;
+  overflow-y: auto;
+  height: 100%;
+}
+
+.tqa-card {
+  border: 1px solid var(--divider-color, var(--color-base-20));
+  border-radius: 8px;
+  padding: 0.75rem;
+  margin-bottom: 0.75rem;
+  background-color: var(--background-secondary);
+}
+
+.tqa-card h4 {
+  margin-top: 0;
+  margin-bottom: 0.25rem;
+}
+
+.tqa-card ul {
+  list-style-type: disc;
+  margin: 0.5rem 0 0.5rem 1.5rem;
+  padding: 0;
+}
+
+.tqa-card a {
+  color: var(--link-color);
+  text-decoration: underline;
+  cursor: pointer;
+}

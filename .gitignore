@@ -1,0 +1,17 @@
+# Sensitive environment files
+.env
+.env.*
+*.env
+
+# Node
+node_modules/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Build outputs (if added later)
+dist/
+build/
+
+data.json
