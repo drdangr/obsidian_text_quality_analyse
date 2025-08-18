@@ -369,6 +369,84 @@ function cosineSimilarity(a, b) {
   return (sim + 1) / 2;
 }
 
+// Robustly parse LLM JSON content which may be double-encoded or wrapped in code fences
+function parseLlmScoresAndComplexity(rawContent) {
+  if (!rawContent || typeof rawContent !== 'string') return null;
+  let txt = rawContent.trim();
+  // Strip common code fences
+  txt = txt.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '');
+  // Sometimes the whole JSON object comes inside extra quotes / is doubly encoded
+  let parsed = null;
+  const tryParse = (s) => {
+    try {
+      const p = JSON.parse(s);
+      if (typeof p === 'string') return JSON.parse(p);
+      return p;
+    } catch (e) {
+      return null;
+    }
+  };
+  parsed = tryParse(txt);
+  if (!parsed) {
+    // Try to extract the first JSON object
+    const m = txt.match(/\{[\s\S]*\}/);
+    if (m) {
+      const objText = m[0].replace(/[""]/g, '"').replace(/['']/g, "'");
+      parsed = tryParse(objText);
+    }
+  }
+  // If still no luck, try to repair truncated JSON
+  if (!parsed && txt.includes('"scores"') && txt.includes('[')) {
+    try {
+      // Try to close unclosed arrays and objects
+      let repaired = txt;
+      // Count open brackets
+      const openBrackets = (repaired.match(/\[/g) || []).length;
+      const closeBrackets = (repaired.match(/\]/g) || []).length;
+      const openBraces = (repaired.match(/\{/g) || []).length;
+      const closeBraces = (repaired.match(/\}/g) || []).length;
+      
+      // Add missing closing brackets
+      for (let i = 0; i < openBrackets - closeBrackets; i++) {
+        repaired += ']';
+      }
+      for (let i = 0; i < openBraces - closeBraces; i++) {
+        repaired += '}';
+      }
+      
+      // Remove trailing comma if present
+      repaired = repaired.replace(/,(\s*[\]\}])/g, '$1');
+      
+      parsed = tryParse(repaired);
+      if (parsed) {
+        console.info('TQA: Successfully repaired truncated JSON');
+      }
+    } catch (e) {
+      // Repair failed, will return null
+    }
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const scores = Array.isArray(parsed.scores) ? parsed.scores : (Array.isArray(parsed) ? parsed : null);
+  const complexity = Array.isArray(parsed.complexity) ? parsed.complexity : null;
+  return { scores, complexity };
+}
+
+function clamp01(n) {
+  n = Number(n);
+  if (!isFinite(n)) return 0;
+  if (n < 0) return 0;
+  if (n > 1) return 1;
+  return n;
+}
+
+function normalizeArray01(arr, targetLen) {
+  if (!Array.isArray(arr)) arr = [];
+  let out = arr.map((x) => clamp01(x));
+  if (out.length > targetLen) out = out.slice(0, targetLen);
+  if (out.length < targetLen) out = out.concat(new Array(targetLen - out.length).fill(0));
+  return out;
+}
+
 /**
  * Request semantic role classification for an array of paragraphs using the
  * OpenAI chat completions API. Each paragraph is classified independently.
@@ -757,6 +835,8 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
     this.metricsVersion = 0;
     this._subjectEmbeddingCache = null;
     this._statusBarItem = null;
+    // Track current analysis to prevent overlapping requests
+    this._currentAnalysis = null;
     // Register the custom view type
     this.registerView(VIEW_TYPE, (leaf) => new TQAView(leaf, this));
     // Register the settings tab
@@ -1000,11 +1080,38 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
   async reanalyze() {
     const file = this.app.workspace.getActiveFile();
     if (!file) return;
+    
+    // Cancel any ongoing analysis
+    if (this._currentAnalysis) {
+      this._currentAnalysis.cancelled = true;
+    }
+    
+    // Clear cache immediately when switching files
+    if (this.metricsCache && this.metricsCache.file !== file.path) {
+      this.metricsCache = null;
+      this._subjectEmbeddingCache = null;
+    }
+    
     const text = await this.app.vault.read(file);
     const paragraphs = splitIntoParagraphs(text);
+    
+    // Create a new analysis context
+    const analysisContext = { cancelled: false, file: file.path };
+    this._currentAnalysis = analysisContext;
+    
     // Show spinner while we may be calling server/LLM
     this.showBusy(true);
-    const metrics = await this.getMetrics(paragraphs).finally(() => this.showBusy(false));
+    const metrics = await this.getMetrics(paragraphs).finally(() => {
+      // Only hide spinner if this is still the current analysis
+      if (this._currentAnalysis === analysisContext) {
+        this.showBusy(false);
+      }
+    });
+    
+    // Check if this analysis was cancelled
+    if (analysisContext.cancelled) {
+      return;
+    }
     // Persist ranges for stable colouring between live edits
     const snrValues = (metrics || []).map((m) => (typeof m.snr === 'number' ? m.snr : 0));
     const compValues = (metrics || []).map((m) => (typeof m.complexity === 'number' ? m.complexity : 0));
@@ -1111,6 +1218,7 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
         const modelName = embeddingModel || 'text-embedding-3-small';
         // Compute SNR by selected method
         let snrArray = [];
+        let llmComplexity = null; // Declare at function scope
         if ((this.settings.snrMethod || 'embedding') === 'embedding') {
           const texts = [subject, ...paragraphs];
           const embs = await fetchOpenAiEmbeddings(apiKey, modelName, texts);
@@ -1124,19 +1232,21 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
             {
               role: 'system',
               content:
-                'You are a relevance scorer. Given a TOPIC and a list of N numbered PARAGRAPHS, output only a JSON object with the exact shape {"scores":[s1,...,sN]}. ' +
-                'Each si must be a real number in the closed interval [0,1] (continuous score, e.g., 0.83, 0.41 — not just 0 or 1). ' +
-                'Use plain JSON numbers (no strings, NaN or Infinity), a dot as the decimal separator, and up to 3 decimals. ' +
-                'The array length must be exactly N and preserve the paragraph order. ' +
-                'Do not include the topic itself in the scoring; score only the numbered paragraphs. ' +
-                'Return only the JSON object without code fences or any extra text.'
+                'You are a scorer. Given a TOPIC and a list of N numbered PARAGRAPHS, output only a JSON object with the exact shape ' +
+                '{"scores":[r1,...,rN], "complexity":[c1,...,cN]}. ' +
+                'Each ri is a continuous relevance score in [0,1] (0 off-topic, 1 perfectly on-topic). ' +
+                'Each ci is a continuous reading complexity score in [0,1] (0 very easy to read, 1 very complex). ' +
+                'Use numbers (no strings), dot as decimal separator, up to 3 decimals. ' +
+                'Both arrays must have length exactly N and preserve paragraph order. ' +
+                'Do not include the topic itself; score only the numbered paragraphs. ' +
+                'Return only the JSON object without code fences or extra text.'
             },
             {
               role: 'user',
               content:
                 `Topic: ${subject}\n\nNumber of paragraphs: ${paragraphs.length}\n\nParagraphs (numbered, one per line):\n` +
                 paragraphs.map((p, i) => `${i+1}. ${p}`).join('\n') +
-                `\n\nReturn strictly a JSON object: {"scores":[${'s,'.repeat(paragraphs.length).slice(0,-1)}]}`
+                `\n\nReturn strictly a JSON object: {"scores":[${'r,'.repeat(paragraphs.length).slice(0,-1)}], "complexity":[${'c,'.repeat(paragraphs.length).slice(0,-1)}]}`
             }
           ];
           const modelNameChat = chatModel || 'gpt-3.5-turbo';
@@ -1162,46 +1272,34 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
           };
           const responseFormat = useSchema ? schemaFormat : { type: 'json_object' };
           let content = '';
+          // Increase token limit to handle longer responses (35 paragraphs * ~10 chars per score * 2 arrays + JSON structure)
+          const maxTokens = Math.max(500, paragraphs.length * 20);
           if (/gpt-5/i.test(modelNameChat)) {
             // No special handling for gpt-5 anymore; treat as regular chat path
-            const data = await callOpenAiChat(apiKey, modelNameChat, messages, { temperature: 0, responseFormat, maxTokens: 200 });
+            const data = await callOpenAiChat(apiKey, modelNameChat, messages, { temperature: 0, responseFormat, maxTokens });
             content = data?.choices?.[0]?.message?.content?.trim() || '';
           } else {
-            const data = await callOpenAiChat(apiKey, modelNameChat, messages, { temperature: 0, responseFormat, maxTokens: 200 });
+            const data = await callOpenAiChat(apiKey, modelNameChat, messages, { temperature: 0, responseFormat, maxTokens });
             content = data?.choices?.[0]?.message?.content?.trim() || '{}';
           }
           try { console.info('TQA: LLM SNR raw response', { model: modelNameChat, content }); } catch (_) {}
-          if (snrArray.length === 0 && content) {
-            try {
-              let parsed = JSON.parse(content);
-              let arr = Array.isArray(parsed?.scores) ? parsed.scores : parsed;
-              if (!Array.isArray(arr)) {
-                // salvage from array text if the model ignored response_format
-                const cleaned = content.replace(/```(?:json)?/g, '').replace(/```/g, '');
-                const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
-                if (arrayMatch) arr = JSON.parse(arrayMatch[0]);
-                else throw new Error('Not an array');
+          let parsedOk = false;
+          if (content) {
+            const obj = parseLlmScoresAndComplexity(content);
+            if (obj && (Array.isArray(obj.scores) || Array.isArray(obj.complexity))) {
+              snrArray = normalizeArray01(obj.scores || [], paragraphs.length);
+              if (Array.isArray(obj.complexity)) {
+                llmComplexity = normalizeArray01(obj.complexity, paragraphs.length);
               }
-              // Coerce values to [0,1] numbers
-              arr = arr.map((x) => (typeof x === 'number' ? Math.max(0, Math.min(1, x)) : 0));
-              // Repair length if needed
-              if (arr.length !== paragraphs.length) {
-                console.warn('TQA: LLM SNR JSON length mismatch or not array', { content, parsed: arr, expected: paragraphs.length });
-                if (arr.length > paragraphs.length) {
-                  arr = arr.slice(0, paragraphs.length);
-                } else if (arr.length < paragraphs.length) {
-                  arr = arr.concat(new Array(paragraphs.length - arr.length).fill(0));
-                }
-              }
-              snrArray = arr;
-            } catch (e) {
-              console.warn('TQA: failed to JSON.parse LLM SNR content', { content, error: e });
-              new Notice('LLM SNR scoring returned invalid JSON; falling back to embeddings.');
-              snrArray = paragraphs.map(() => 0);
+              parsedOk = true;
+              try { console.info('TQA: LLM parsed lengths', { scores: snrArray.length, complexity: llmComplexity ? llmComplexity.length : 0, paragraphs: paragraphs.length }); } catch (_) {}
+            } else {
+              console.warn('TQA: parser returned null; falling back to heuristics for complexity if needed', { raw: content?.slice?.(0, 200) });
             }
           }
           // Fallback to embeddings if all zeros
-          if (snrArray.every((v) => v === 0)) {
+          if (!parsedOk || snrArray.every((v) => v === 0)) {
+            try { console.warn('TQA: Fallback to embeddings (LLM returned zero/invalid scores)', { scores: snrArray, complexity: llmComplexity, paragraphs: paragraphs.length }); } catch (_) {}
             new Notice('LLM SNR scoring failed to return valid data; falling back to embeddings.');
             const texts = [subject, ...paragraphs];
             const embs = await fetchOpenAiEmbeddings(apiKey, modelName, texts);
@@ -1225,7 +1323,7 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
         const results = [];
         for (let i = 0; i < paragraphs.length; i++) {
           const snr = snrArray[i] ?? 0;
-          const complexity = heurMetrics[i] ? heurMetrics[i].complexity : 0;
+          const complexity = (typeof llmComplexity?.[i] === 'number') ? llmComplexity[i] : (heurMetrics[i] ? heurMetrics[i].complexity : 0);
           results.push({ snr, complexity, topic: snr, role: roles[i] });
         }
         return results;
