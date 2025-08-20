@@ -835,6 +835,8 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
     this.metricsVersion = 0;
     this._subjectEmbeddingCache = null;
     this._statusBarItem = null;
+    // Debounce timeout for partial analysis after typing pauses
+    this._analysisTimeout = null;
     // Track current analysis to prevent overlapping requests
     this._currentAnalysis = null;
     // Register the custom view type
@@ -854,11 +856,11 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
     this.addCommand({
       id: 'reanalyze-text-quality',
       name: 'Analyze Current Note',
-      callback: () => this.reanalyze()
+      callback: () => this.reanalyzeForced()
     });
     // Recompute metrics whenever the active file changes
     this.registerEvent(this.app.workspace.on('file-open', () => {
-      this.reanalyze();
+      this.reanalyzeForced();
     }));
 
     // Add a ribbon icon on the left to quickly open this plugin's settings
@@ -901,6 +903,130 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
   }
 
   /**
+   * Запускает полный анализ всего файла.
+   * Этот метод вызывается вручную (по команде или при открытии файла).
+   */
+  async reanalyzeForced() {
+    const file = this.app.workspace.getActiveFile();
+    if (!file) return;
+
+    // Cancel pending partial analysis debounce
+    if (this._analysisTimeout) {
+      clearTimeout(this._analysisTimeout);
+      this._analysisTimeout = null;
+    }
+
+    // Cancel any ongoing analysis
+    if (this._currentAnalysis) {
+      this._currentAnalysis.cancelled = true;
+    }
+
+    // Clear cache immediately when switching files
+    if (this.metricsCache && this.metricsCache.file !== file.path) {
+      this.metricsCache = null;
+      this._subjectEmbeddingCache = null;
+    }
+
+    const text = await this.app.vault.read(file);
+    const paragraphs = splitIntoParagraphs(text);
+
+    // Create a new analysis context
+    const analysisContext = { cancelled: false, file: file.path };
+    this._currentAnalysis = analysisContext;
+
+    // Show spinner while we may be calling server/LLM
+    this.showBusy(true);
+    const metrics = await this.getMetrics(paragraphs).finally(() => {
+      // Only hide spinner if this is still the current analysis
+      if (this._currentAnalysis === analysisContext) {
+        this.showBusy(false);
+      }
+    });
+
+    // Check if this analysis was cancelled
+    if (analysisContext.cancelled) {
+      return;
+    }
+
+    // Persist ranges for stable colouring between live edits
+    const snrValues = (metrics || []).map((m) => (typeof m.snr === 'number' ? m.snr : 0));
+    const compValues = (metrics || []).map((m) => (typeof m.complexity === 'number' ? m.complexity : 0));
+    const ranges = {
+      snrMin: snrValues.length ? Math.min(...snrValues) : 0,
+      snrMax: snrValues.length ? Math.max(...snrValues) : 1,
+      compMin: compValues.length ? Math.min(...compValues) : 0,
+      compMax: compValues.length ? Math.max(...compValues) : 1
+    };
+    this.metricsCache = { file: file.path, metrics, paragraphs, ranges };
+    // Signal to the editor decoration plugin that metrics have changed
+    this.metricsVersion = (this.metricsVersion || 0) + 1;
+    // Refresh decorations immediately after computing metrics
+    this._forceRefreshEditors();
+    // Update card view if it is open
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
+    for (const leaf of leaves) {
+      const view = leaf.view;
+      if (view && typeof view.renderMetrics === 'function') {
+        view.renderMetrics(this.metricsCache);
+      }
+    }
+  }
+
+  /**
+   * Запускает точечный анализ для указанных абзацев с задержкой.
+   * Этот метод будет вызван после паузы в наборе текста.
+   */
+  reanalyzeWithDebounce(indices) {
+    if (this._analysisTimeout) {
+      clearTimeout(this._analysisTimeout);
+    }
+    this._analysisTimeout = setTimeout(async () => {
+      this._analysisTimeout = null;
+      const file = this.app.workspace.getActiveFile();
+      if (!file) return;
+
+      const text = await this.app.vault.read(file);
+      const paragraphs = splitIntoParagraphs(text);
+
+      this.showBusy(true);
+      try {
+        const partial = await this.recomputeMetricsForIndices(paragraphs, indices);
+        if (this.metricsCache && this.metricsCache.file === file.path) {
+          indices.forEach((i) => {
+            if (this.metricsCache.metrics[i]) {
+              if (Object.prototype.hasOwnProperty.call(partial.snrByIndex, i)) {
+                const v = partial.snrByIndex[i];
+                this.metricsCache.metrics[i].snr = typeof v === 'number' ? v : 0;
+                this.metricsCache.metrics[i].topic = typeof v === 'number' ? v : 0;
+              }
+              if (Object.prototype.hasOwnProperty.call(partial.complexityByIndex, i)) {
+                const c = partial.complexityByIndex[i];
+                if (typeof c === 'number') this.metricsCache.metrics[i].complexity = c;
+              }
+            }
+          });
+
+          this.metricsVersion = (this.metricsVersion || 0) + 1;
+          this._forceRefreshEditors();
+
+          const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
+          for (const leaf of leaves) {
+            const view = leaf.view;
+            if (view && typeof view.renderMetrics === 'function') {
+              view.renderMetrics(this.metricsCache);
+            }
+          }
+        }
+      } catch (err) {
+        new Notice('Ошибка при анализе абзацев.');
+        console.error('Ошибка при reanalyzeWithDebounce:', err);
+      } finally {
+        this.showBusy(false);
+      }
+    }, 1000);
+  }
+
+  /**
    * Create a CodeMirror ViewPlugin that decorates entire lines according to
    * paragraph metrics. Whenever the document changes, paragraphs are
    * re‑extracted and the associated colours recomputed. Rendering is debounced
@@ -935,7 +1061,7 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
           // will bump metricsVersion and we will recompute on the next update.
           if (!plugin.metricsCache || plugin.metricsCache.file !== file.path) {
             // Fire and forget; no await to avoid recursion in updates
-            plugin.reanalyze();
+            plugin.reanalyzeForced();
           }
           const paragraphs = splitIntoParagraphs(docText);
           // Acquire metrics: use cached metrics if the same number of paragraphs
@@ -1026,41 +1152,79 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
         }
 
         update(update) {
-          // When document changes, update complexity on-the-fly for all paragraphs
+          // When document changes, update complexity on-the-fly for changed paragraphs only
           if (update.docChanged) {
             const file = plugin.app.workspace.getActiveFile();
-            if (file) {
-              const state = this.view.state;
-              const text = state.doc.toString();
-              const paragraphs = splitIntoParagraphs(text);
+            if (!file) return;
 
-              // Build new metrics array, preserving previous SNR where possible
-              const prev = plugin.metricsCache && plugin.metricsCache.file === file.path ? plugin.metricsCache : null;
-              const newMetrics = new Array(paragraphs.length);
-              for (let i = 0; i < paragraphs.length; i++) {
-                const smogInfo = russianSmogIndex(paragraphs[i]);
-                const lix = russianLixIndex(paragraphs[i]);
-                const complexity = calculateComplexity(lix, smogInfo.value, smogInfo.valid);
-                const prevItem = prev && prev.metrics && prev.metrics[i] ? prev.metrics[i] : { snr: 0, topic: 0, role: '' };
-                newMetrics[i] = {
-                  snr: typeof prevItem.snr === 'number' ? prevItem.snr : 0,
-                  complexity,
-                  topic: typeof prevItem.topic === 'number' ? prevItem.topic : 0,
-                  role: prevItem.role || ''
-                };
+            const state = this.view.state;
+            // Build paragraph ranges in the NEW doc
+            const paraRanges = [];
+            let currentParaStart = 0;
+            for (let i = 1; i <= state.doc.lines; i++) {
+              const line = state.doc.line(i);
+              if (line.text.trim() === '') {
+                if (line.from > currentParaStart) {
+                  paraRanges.push({ from: currentParaStart, to: line.from });
+                }
+                currentParaStart = line.to + 1;
               }
+            }
+            if (state.doc.length > currentParaStart) {
+              paraRanges.push({ from: currentParaStart, to: state.doc.length });
+            }
 
-              // Preserve previously analysed SNR/topic/role and ranges to keep colours stable
-              const ranges = prev && prev.ranges ? prev.ranges : null;
-              plugin.metricsCache = ranges
-                ? { file: file.path, metrics: newMetrics, paragraphs, ranges }
-                : { file: file.path, metrics: newMetrics, paragraphs };
-              plugin.metricsVersion = (plugin.metricsVersion || 0) + 1;
+            // Collect changed ranges in NEW doc coordinates
+            const changedRanges = [];
+            try {
+              update.changes.iterChangedRanges((fromA, toA, fromB, toB) => {
+                changedRanges.push({ from: fromB, to: toB });
+              });
+            } catch (e) {
+              // Fallback: mark all as changed
+              changedRanges.push({ from: 0, to: state.doc.length });
+            }
+
+            // Prepare new metrics and paragraph texts, preserving previous where unchanged
+            const prev = plugin.metricsCache && plugin.metricsCache.file === file.path ? plugin.metricsCache : null;
+            const newMetrics = new Array(paraRanges.length);
+            const newParaTexts = new Array(paraRanges.length);
+            const changedIndices = new Set();
+
+            paraRanges.forEach((para, i) => {
+              const paraText = state.doc.sliceString(para.from, para.to).trim();
+              newParaTexts[i] = paraText;
+
+              // Determine if this paragraph intersects any changed range
+              let isChanged = false;
+              for (const r of changedRanges) {
+                if (r.from < para.to && r.to > para.from) { isChanged = true; break; }
+              }
+              if (isChanged) changedIndices.add(i);
+
+              if (!isChanged && prev && prev.metrics && prev.metrics[i]) {
+                newMetrics[i] = prev.metrics[i];
+              } else {
+                const smogInfo = russianSmogIndex(paraText);
+                const lix = russianLixIndex(paraText);
+                const complexity = calculateComplexity(lix, smogInfo.value, smogInfo.valid);
+                newMetrics[i] = { snr: 0, complexity, topic: 0, role: '' };
+              }
+            });
+
+            const ranges = prev && prev.ranges ? prev.ranges : null;
+            plugin.metricsCache = ranges
+              ? { file: file.path, metrics: newMetrics, paragraphs: newParaTexts, ranges }
+              : { file: file.path, metrics: newMetrics, paragraphs: newParaTexts };
+            plugin.metricsVersion = (plugin.metricsVersion || 0) + 1;
+
+            if (changedIndices.size > 0) {
+              plugin.reanalyzeWithDebounce(Array.from(changedIndices));
             }
           }
 
           // Recompute decorations when metricsVersion changed or doc changed
-          if (update.docChanged || update.annotations?.some?.(a => a.type === RefreshAnnotation) || (this._lastMetricsVersion !== plugin.metricsVersion)) {
+          if (update.docChanged || update.annotations?.some?.((a) => a.type === RefreshAnnotation) || (this._lastMetricsVersion !== plugin.metricsVersion)) {
             this._lastMetricsVersion = plugin.metricsVersion;
             this.computeDecorations();
           }
@@ -1430,6 +1594,156 @@ module.exports = class TextQualityAnalyzerPlugin extends Plugin {
       result[i] = words.length > 0 ? uniq.size / words.length : 0;
     }
     return result;
+  }
+
+  /**
+   * Частичный пересчёт метрик (SNR и Complexity) только для указанных индексов абзацев.
+   * Возвращает { snrByIndex: Record<number, number>, complexityByIndex: Record<number, number> }.
+   */
+  async recomputeMetricsForIndices(paragraphs, indices) {
+    const uniqIndices = Array.from(new Set(indices.filter((i) => i >= 0 && i < paragraphs.length)));
+    const snrByIndex = {};
+    const complexityByIndex = {};
+    if (uniqIndices.length === 0) return { snrByIndex, complexityByIndex };
+
+    const { backendMode, httpEndpoint, topic, apiKey, embeddingModel, chatModel } = this.settings;
+    // Precompute heuristic complexity for fallback
+    const subsetParas = uniqIndices.map((i) => paragraphs[i]);
+    const heurSubset = computeHeuristicMetrics(subsetParas, topic || '');
+    const applyHeuristics = () => {
+      for (let k = 0; k < uniqIndices.length; k++) {
+        const i = uniqIndices[k];
+        const h = heurSubset[k] || { snr: 0, complexity: 0 };
+        snrByIndex[i] = typeof h.snr === 'number' ? h.snr : 0;
+        complexityByIndex[i] = typeof h.complexity === 'number' ? h.complexity : 0;
+      }
+    };
+
+    try {
+      if (backendMode === 'server') {
+        const res = await fetch(httpEndpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ paragraphs: subsetParas, topic })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          for (let k = 0; k < uniqIndices.length; k++) {
+            const i = uniqIndices[k];
+            const item = data[k] || {};
+            snrByIndex[i] = typeof item.snr === 'number' ? item.snr : 0;
+            const c = typeof item.complexity === 'number' ? item.complexity : (heurSubset[k] ? heurSubset[k].complexity : 0);
+            complexityByIndex[i] = c;
+          }
+          return { snrByIndex, complexityByIndex };
+        }
+      } else if (backendMode === 'openai' || (backendMode === 'auto' && apiKey)) {
+        const subject = topic && topic.trim().length > 0 ? topic : (paragraphs[0] || '');
+        const modelName = embeddingModel || 'text-embedding-3-small';
+        if ((this.settings.snrMethod || 'embedding') === 'embedding') {
+          // SNR via embeddings, complexity via heuristics
+          let subjectEmb;
+          if (this._subjectEmbeddingCache && this._subjectEmbeddingCache.text === subject && this._subjectEmbeddingCache.model === modelName) {
+            subjectEmb = this._subjectEmbeddingCache.embedding;
+          } else {
+            const subjEmb = await fetchOpenAiEmbeddings(apiKey, modelName, [subject]);
+            subjectEmb = subjEmb[0];
+            try { this._subjectEmbeddingCache = { text: subject, model: modelName, embedding: subjectEmb }; } catch (e) {}
+          }
+          const paraEmbs = await fetchOpenAiEmbeddings(apiKey, modelName, subsetParas);
+          for (let k = 0; k < uniqIndices.length; k++) {
+            const i = uniqIndices[k];
+            snrByIndex[i] = cosineSimilarity(subjectEmb, paraEmbs[k]);
+            const c = heurSubset[k] ? heurSubset[k].complexity : 0;
+            complexityByIndex[i] = c;
+          }
+          return { snrByIndex, complexityByIndex };
+        } else {
+          // LLM scoring for both snr and complexity on the subset
+          const messages = [
+            {
+              role: 'system',
+              content:
+                'You are a scorer. Given a TOPIC and a list of N numbered PARAGRAPHS, output only a JSON object with the exact shape ' +
+                '{"scores":[r1,...,rN], "complexity":[c1,...,cN]}. ' +
+                'Each ri is a continuous relevance score in [0,1] (0 off-topic, 1 perfectly on-topic). ' +
+                'Each ci is a continuous reading complexity score in [0,1] (0 very easy to read, 1 very complex). ' +
+                'Use numbers (no strings), dot as decimal separator, up to 3 decimals. ' +
+                'Both arrays must have length exactly N and preserve paragraph order. ' +
+                'Do not include the topic itself; score only the numbered paragraphs. ' +
+                'Return only the JSON object without code fences or extra text.'
+            },
+            {
+              role: 'user',
+              content:
+                `Topic: ${subject}\n\nNumber of paragraphs: ${subsetParas.length}\n\nParagraphs (numbered, one per line):\n` +
+                subsetParas.map((p, i) => `${i + 1}. ${p}`).join('\n') +
+                `\n\nReturn strictly a JSON object: {"scores":[${'r,'.repeat(subsetParas.length).slice(0, -1)}], "complexity":[${'c,'.repeat(subsetParas.length).slice(0, -1)}]}`
+            }
+          ];
+          const modelNameChat = chatModel || 'gpt-3.5-turbo';
+          const useSchema = /gpt-4o|gpt-5/i.test(modelNameChat);
+          const schemaFormat = {
+            type: 'json_schema',
+            json_schema: {
+              name: 'snr_scores_subset',
+              schema: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  scores: {
+                    type: 'array',
+                    items: { type: 'number', minimum: 0, maximum: 1 },
+                    minItems: subsetParas.length,
+                    maxItems: subsetParas.length
+                  },
+                  complexity: {
+                    type: 'array',
+                    items: { type: 'number', minimum: 0, maximum: 1 },
+                    minItems: subsetParas.length,
+                    maxItems: subsetParas.length
+                  }
+                },
+                required: ['scores', 'complexity']
+              }
+            }
+          };
+          const responseFormat = useSchema ? schemaFormat : { type: 'json_object' };
+          const maxTokens = Math.max(300, subsetParas.length * 20);
+          const data = await callOpenAiChat(apiKey, modelNameChat, messages, { temperature: 0, responseFormat, maxTokens });
+          const content = data?.choices?.[0]?.message?.content?.trim() || '';
+          const parsed = parseLlmScoresAndComplexity(content) || {};
+          const scores = Array.isArray(parsed.scores) ? parsed.scores : [];
+          const complexities = Array.isArray(parsed.complexity) ? parsed.complexity : [];
+          for (let k = 0; k < uniqIndices.length; k++) {
+            const i = uniqIndices[k];
+            const s = typeof scores[k] === 'number' ? scores[k] : 0;
+            const c = typeof complexities[k] === 'number' ? complexities[k] : (heurSubset[k] ? heurSubset[k].complexity : 0);
+            snrByIndex[i] = s;
+            complexityByIndex[i] = c;
+          }
+          // If all zeros, fallback to embeddings for SNR
+          if (uniqIndices.every((_, k) => (snrByIndex[uniqIndices[k]] || 0) === 0)) {
+            try {
+              const texts = [subject, ...subsetParas];
+              const embs = await fetchOpenAiEmbeddings(apiKey, embeddingModel || 'text-embedding-3-small', texts);
+              const subjectEmb = embs[0];
+              for (let k = 1; k < embs.length; k++) {
+                const idx = uniqIndices[k - 1];
+                snrByIndex[idx] = cosineSimilarity(subjectEmb, embs[k]);
+              }
+            } catch (e) {}
+          }
+          return { snrByIndex, complexityByIndex };
+        }
+      }
+    } catch (e) {
+      // fall through to heuristic fallback
+    }
+
+    // Heuristic fallback for both metrics
+    applyHeuristics();
+    return { snrByIndex, complexityByIndex };
   }
 
   /**
